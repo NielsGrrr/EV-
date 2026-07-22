@@ -11,6 +11,7 @@ const JSON_URL = process.env.WINAMAX_JSON_URL;
 const WINAMAX_HTML_URL = "https://www.winamax.fr/paris-sportifs/sports/1";
 const REF_ODDS_API_URL = process.env.REF_ODDS_API_URL; // ex: https://api.myoddsprovider.com/getOdds
 const REF_ODDS_API_KEY = process.env.REF_ODDS_API_KEY;
+const REF_ODDS_PROVIDER = process.env.REF_ODDS_PROVIDER || null; // optional provider name for storage
 
 function impliedProbFromPrice(price: number) {
   return 1 / price;
@@ -28,6 +29,63 @@ function computeEvPlusPercent(probWinamax: number, probRef: number) {
 
 async function fetchReferenceOdds(home: string, away: string, startAt: Date) {
   if (!REF_ODDS_API_URL) return null;
+  // Special-case: built-in support for TheOddsAPI when provider is set
+  if (REF_ODDS_PROVIDER === "theoddsapi" && REF_ODDS_API_KEY) {
+    try {
+      const base = "https://api.the-odds-api.com/v4/sports/soccer/odds/";
+      const params = {
+        regions: "eu",
+        markets: "1x2",
+        oddsFormat: "decimal",
+        dateFormat: "iso",
+        apiKey: REF_ODDS_API_KEY,
+      } as any;
+
+      const res = await axios.get(base, { params, timeout: 15000 });
+      const data = res.data;
+      if (!Array.isArray(data)) return null;
+
+      // Find an event matching home/away (case-insensitive, allowing partial matches)
+      const matchEvent = data.find((ev: any) => {
+        const teams = [ev.home_team ?? ev.teams?.[0], ev.away_team ?? ev.teams?.[1]];
+        if (!teams || teams.length < 2) return false;
+        const h = teams[0]?.toString().toLowerCase() || "";
+        const a = teams[1]?.toString().toLowerCase() || "";
+        return (h.includes(home.toLowerCase()) && a.includes(away.toLowerCase())) || (h.includes(away.toLowerCase()) && a.includes(home.toLowerCase()));
+      });
+
+      if (matchEvent) {
+        // Extract prices from first bookmaker with market 1x2
+        const bookmakers = matchEvent.bookmakers ?? [];
+        for (const bm of bookmakers) {
+          for (const m of bm.markets ?? []) {
+            if (/1x2|h2h|match result|1n2/i.test(m.key ?? m.key)) {
+              const outcomes = m.outcomes ?? [];
+              // outcomes order may vary; map by name
+              const map: Record<string, number> = {};
+              for (const o of outcomes) {
+                const name = (o.name ?? o.outcome ?? "").toString().toLowerCase();
+                const price = Number(o.price ?? o.odds ?? o.priceDecimal ?? o.oddsDecimal ?? o);
+                if (name.includes("home") || name.includes("team1") || name.includes("1") ) map["1"] = price;
+                if (name.includes("draw") || name.includes("x") || name.includes("n")) map["N"] = price;
+                if (name.includes("away") || name.includes("team2") || name.includes("2")) map["2"] = price;
+              }
+              if (map["1"] && map["N"] && map["2"]) return [map["1"], map["N"], map["2"]];
+              // fallback: if exactly 3 outcomes, return their prices
+              if (outcomes.length >= 3) {
+                const nums = outcomes.slice(0,3).map((o:any)=>Number(o.price ?? o.odds ?? o));
+                if (nums.every((n:number)=>isFinite(n) && n>0)) return nums;
+              }
+            }
+          }
+        }
+      }
+      return null;
+    } catch (err) {
+      console.warn("TheOddsAPI fetch failed:", err instanceof Error ? err.message : err);
+      // fallthrough to generic handler below if an explicit REF_ODDS_API_URL is provided
+    }
+  }
   try {
     const params: any = { home: home, away: away, date: startAt.toISOString() };
     const headers: any = {};
@@ -425,10 +483,13 @@ export async function fetchWinamaxAndStore() {
             const price = prices[i];
             const probability = winNormalized[i];
             const evPlus = computeEvPlusPercent(winNormalized[i], refNormalized[i]);
+            const refPrice = refPrices ? refPrices[i] : null;
+            const refProb = refNormalized ? refNormalized[i] : null;
+            const refProvider = REF_ODDS_PROVIDER || (REF_ODDS_API_URL ? new URL(REF_ODDS_API_URL).host : null);
 
             await prisma.odds.upsert({
               where: { id: `${match.id}-${outcome}` },
-              update: { price, probability, evPlus },
+              update: { price, probability, evPlus, refPrice, refProvider, refProb },
               create: {
                 id: `${match.id}-${outcome}`,
                 matchId: match.id,
@@ -437,6 +498,9 @@ export async function fetchWinamaxAndStore() {
                 outcome,
                 price,
                 probability,
+                refPrice,
+                refProvider,
+                refProb,
                 evPlus,
               },
             });
@@ -475,6 +539,9 @@ export async function fetchWinamaxAndStore() {
                 const price = extracted[i];
                 const probability = winNormalized[i];
                 const evPlus = computeEvPlusPercent(winNormalized[i], refNormalized[i]);
+                const refPrice = refPrices ? refPrices[i] : null;
+                const refProb = refNormalized ? refNormalized[i] : null;
+                const refProvider = REF_ODDS_PROVIDER || (REF_ODDS_API_URL ? new URL(REF_ODDS_API_URL).host : null);
 
                 await prisma.odds.create({
                   data: {
@@ -484,6 +551,9 @@ export async function fetchWinamaxAndStore() {
                     outcome: outcomeLabel,
                     price,
                     probability,
+                    refPrice,
+                    refProvider,
+                    refProb,
                     evPlus,
                   },
                 });
