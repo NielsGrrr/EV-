@@ -28,6 +28,9 @@ model Odds {
   outcome     String
   price       Float
   probability Float?
+  refPrice    Float?
+  refProvider String?
+  refProb     Float?
   evPlus      Float?
   timestamp   DateTime @default(now())
   @@index([matchId])
