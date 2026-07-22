@@ -530,26 +530,22 @@ export async function fetchWinamaxAndStore() {
           const modelProbs = await fetchModelProbabilities(home, away, new Date(startAt));
 
           // Determine true probability as weighted combo: model (if any) and reference market (if any)
+          // Apply safe fallbacks so the formula never yields NaN:
+          // - modelProb falls back to the raw implied probability (1/price) if xG unavailable
+          // - refProb falls back to the market-normalized probabilities if ref API unavailable
           const trueProbabilities: number[] = [0, 0, 0];
           for (let i = 0; i < 3; i++) {
             const marketProb = winNormalized[i];
-            const refProb = refNormalized ? refNormalized[i] : null;
-            const modelProb = modelProbs ? modelProbs[i] : null;
+            const refProbFallback = winNormalized[i];
+            const refProb = refNormalized ? refNormalized[i] : refProbFallback;
+            const implied = impliedProbFromPrice(prices[i]);
+            const modelProb = modelProbs ? modelProbs[i] : implied; // fallback to 1/price
 
-            let trueP: number;
-            if (modelProb !== null && refProb !== null) {
-              // combine model and market-reference
-              trueP = MODEL_WEIGHT * modelProb + (1 - MODEL_WEIGHT) * refProb;
-            } else if (refProb !== null) {
-              trueP = refProb; // use market reference
-            } else if (modelProb !== null) {
-              trueP = modelProb; // use internal model
-            } else {
-              // conservative fallback: use winamax normalized (no EV)
-              trueP = winNormalized[i];
-            }
+            // Combine using MODEL_WEIGHT; if both come from fallback, result equals market
+            const trueP = MODEL_WEIGHT * modelProb + (1 - MODEL_WEIGHT) * refProb;
 
-            trueProbabilities[i] = trueP;
+            // clamp between 0 and 1
+            trueProbabilities[i] = Math.max(0, Math.min(1, Number(trueP) || 0));
           }
 
           // Persist per outcome
@@ -612,14 +608,13 @@ export async function fetchWinamaxAndStore() {
 
               const trueProbabilities: number[] = [0,0,0];
               for (let i = 0; i < 3; i++) {
-                const refProb = refNormalized ? refNormalized[i] : null;
-                const modelProb = modelProbs ? modelProbs[i] : null;
-                let trueP: number;
-                if (modelProb !== null && refProb !== null) trueP = MODEL_WEIGHT * modelProb + (1 - MODEL_WEIGHT) * refProb;
-                else if (refProb !== null) trueP = refProb;
-                else if (modelProb !== null) trueP = modelProb;
-                else trueP = winNormalized[i];
-                trueProbabilities[i] = trueP;
+                const refProbFallback = winNormalized[i];
+                const refProb = refNormalized ? refNormalized[i] : refProbFallback;
+                const implied = impliedProbFromPrice(extracted[i]);
+                const modelProb = modelProbs ? modelProbs[i] : implied; // fallback to 1/price
+
+                const trueP = MODEL_WEIGHT * modelProb + (1 - MODEL_WEIGHT) * refProb;
+                trueProbabilities[i] = Math.max(0, Math.min(1, Number(trueP) || 0));
               }
 
               for (let i = 0; i < 3; i++) {
