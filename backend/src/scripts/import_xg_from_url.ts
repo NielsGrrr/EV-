@@ -1,5 +1,5 @@
 import axios from "axios";
-import xgService from "../src/xgService";
+import xgService from "../xgService";
 
 function parseCsv(text: string) {
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);

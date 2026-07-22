@@ -3,7 +3,7 @@ import cron from "node-cron";
 import { PrismaClient } from "@prisma/client";
 import { fetchWinamaxAndStore } from "./scraper";
 import xgService from "./xgService";
-import importXg from "../scripts/import_xg_from_url";
+import importXg from "./scripts/import_xg_from_url";
 import dotenv from "dotenv";
 
 dotenv.config();
