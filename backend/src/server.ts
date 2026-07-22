@@ -2,6 +2,7 @@ import express from "express";
 import cron from "node-cron";
 import { PrismaClient } from "@prisma/client";
 import { fetchWinamaxAndStore } from "./scraper";
+import xgService from "./xgService";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -39,6 +40,45 @@ async function startServer() {
         error: "Erreur serveur",
         details: process.env.NODE_ENV === "development" && err instanceof Error ? err.message : undefined,
       });
+    }
+  });
+
+  // xG service endpoints
+  app.get("/api/xg", async (req, res) => {
+    try {
+      const home = String(req.query.home || "");
+      const away = String(req.query.away || "");
+      if (!home || !away) return res.status(400).json({ error: "home and away query parameters are required" });
+      const est = xgService.estimateXgForMatch(home, away);
+      res.json(est);
+    } catch (err) {
+      console.error("/api/xg error:", err);
+      res.status(500).json({ error: "xg estimation failed" });
+    }
+  });
+
+  app.use(express.json());
+  // Admin: upsert a team stat
+  app.post("/api/xg", async (req, res) => {
+    try {
+      const { team, home_xg, away_xg } = req.body;
+      if (!team || home_xg == null || away_xg == null) return res.status(400).json({ error: "team, home_xg and away_xg are required" });
+      const ok = xgService.upsertTeamStats(team, Number(home_xg), Number(away_xg));
+      if (!ok) return res.status(500).json({ error: "failed to save" });
+      res.json({ ok: true });
+    } catch (err) {
+      console.error("POST /api/xg failed:", err);
+      res.status(500).json({ error: "internal" });
+    }
+  });
+
+  app.get("/api/xg/stats", async (req, res) => {
+    try {
+      const stats = xgService.listTeamStats();
+      res.json(stats);
+    } catch (err) {
+      console.error("GET /api/xg/stats failed:", err);
+      res.status(500).json({ error: "internal" });
     }
   });
 
