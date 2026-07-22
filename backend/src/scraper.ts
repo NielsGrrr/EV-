@@ -9,6 +9,100 @@ const SOCKET_PATH = process.env.WINAMAX_SOCKET_PATH || "/socket.io";
 const SOCKET_QUERY = process.env.WINAMAX_SOCKET_QUERY;
 const JSON_URL = process.env.WINAMAX_JSON_URL;
 const WINAMAX_HTML_URL = "https://www.winamax.fr/paris-sportifs/sports/1";
+const REF_ODDS_API_URL = process.env.REF_ODDS_API_URL; // ex: https://api.myoddsprovider.com/getOdds
+const REF_ODDS_API_KEY = process.env.REF_ODDS_API_KEY;
+
+function impliedProbFromPrice(price: number) {
+  return 1 / price;
+}
+
+function normalizeImpliedProbs(implied: number[]) {
+  const sum = implied.reduce((s, v) => s + v, 0);
+  if (sum === 0) return implied.map(() => 0);
+  return implied.map((v) => v / sum);
+}
+
+function computeEvPlusPercent(probWinamax: number, probRef: number) {
+  return (probWinamax - probRef) * 100;
+}
+
+async function fetchReferenceOdds(home: string, away: string, startAt: Date) {
+  if (!REF_ODDS_API_URL) return null;
+  try {
+    const params: any = { home: home, away: away, date: startAt.toISOString() };
+    const headers: any = {};
+    if (REF_ODDS_API_KEY) headers["Authorization"] = `Bearer ${REF_ODDS_API_KEY}`;
+    const res = await axios.get(REF_ODDS_API_URL, { params, headers, timeout: 15000 });
+    const data = res.data;
+
+    // Try to extract 1X2 prices from common shapes.
+    // Expecting an array of bookmakers or a single object with markets.
+    // We'll look for a market named "1X2", "1N2", "Match Result", or similar.
+    const attempts: number[] = [];
+
+    // Helper to push prices if found and valid
+    const pushIfValid = (arr: any[]) => {
+      if (!arr || arr.length < 3) return false;
+      const nums = arr.slice(0, 3).map((p: any) => Number(p));
+      if (nums.some((n: number) => !isFinite(n) || n <= 0)) return false;
+      attempts.push(nums[0], nums[1], nums[2]);
+      return true;
+    };
+
+    // If provider returns { prices: { home, draw, away } }
+    if (data?.prices && data.prices.home && data.prices.draw && data.prices.away) {
+      return [Number(data.prices.home), Number(data.prices.draw), Number(data.prices.away)];
+    }
+
+    // If returns array of offers
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        // market-based
+        if (item?.market && /1\s?X?N?2|match result|1n2/i.test(item.market)) {
+          const prices = item.prices ?? item.odds ?? item.outcomes;
+          if (Array.isArray(prices) && prices.length >= 3) {
+            const nums = prices.slice(0, 3).map((p: any) => Number(p.price ?? p.odds ?? p));
+            if (nums.every((n) => isFinite(n) && n > 0)) return nums;
+          }
+        }
+
+        // bookmaker style: {bookmaker: '', markets: [...] }
+        if (item?.markets && Array.isArray(item.markets)) {
+          for (const mkt of item.markets) {
+            if (/1\s?X?N?2|match result|1n2/i.test(mkt.name ?? mkt.key ?? '')) {
+              const prices = mkt.outcomes ?? mkt.prices ?? mkt.odds;
+              if (Array.isArray(prices) && prices.length >= 3) {
+                const nums = prices.slice(0, 3).map((p: any) => Number(p.price ?? p.odds ?? p));
+                if (nums.every((n) => isFinite(n) && n > 0)) return nums;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // If data has bookmakers map
+    if (data?.bookmakers && Array.isArray(data.bookmakers)) {
+      for (const bm of data.bookmakers) {
+        for (const mkt of bm.markets ?? []) {
+          if (/1\s?X?N?2|match result|1n2/i.test(mkt.key ?? mkt.name ?? '')) {
+            const prices = mkt.outcomes ?? mkt.prices ?? mkt.odds;
+            if (Array.isArray(prices) && prices.length >= 3) {
+              const nums = prices.slice(0, 3).map((p: any) => Number(p.price ?? p.odds ?? p));
+              if (nums.every((n) => isFinite(n) && n > 0)) return nums;
+            }
+          }
+        }
+      }
+    }
+
+    // No usable ref odds
+    return null;
+  } catch (err) {
+    console.warn("Reference odds fetch error:", err instanceof Error ? err.message : err);
+    return null;
+  }
+}
 
 async function fetchWithSocketIO() {
   if (!SOCKET_URL) {
@@ -303,58 +397,121 @@ export async function fetchWinamaxAndStore() {
       // Si c'est un match HTML avec structure odds simple
       if (ev.odds && typeof ev.odds === "object" && !Array.isArray(ev.odds)) {
         const oddsMap = ev.odds as Record<string, number | null>;
-        for (const [outcome, price] of Object.entries(oddsMap)) {
-          if (!price || price === 0) continue;
+        // Order outcomes as [home, draw, away]
+        const priceHome = Number(oddsMap["1"] ?? oddsMap["home"] ?? oddsMap["Home"] ?? 0) || 0;
+        const priceDraw = Number(oddsMap["N"] ?? oddsMap["draw"] ?? 0) || 0;
+        const priceAway = Number(oddsMap["2"] ?? oddsMap["away"] ?? oddsMap["Away"] ?? 0) || 0;
 
-          const impliedProb = 1 / price;
-          const estimatedProb = impliedProb * 1.02;
-          const evPlus = (estimatedProb - impliedProb) * 100;
+        const prices = [priceHome, priceDraw, priceAway];
+        const valid = prices.every((p) => p > 0);
+        if (valid) {
+          const winImplied = prices.map(impliedProbFromPrice);
+          const winNormalized = normalizeImpliedProbs(winImplied);
 
-          await prisma.odds.upsert({
-            where: {
-              id: `${match.id}-${outcome}`,
-            },
-            update: {
-              price,
-              probability: estimatedProb,
-              evPlus,
-            },
-            create: {
-              id: `${match.id}-${outcome}`,
-              matchId: match.id,
-              provider: "winamax",
-              market: "1N2",
-              outcome,
-              price,
-              probability: estimatedProb,
-              evPlus,
-            },
-          });
+          const refPrices = await fetchReferenceOdds(home, away, new Date(startAt));
+          let refNormalized: number[] | null = null;
+          if (refPrices) {
+            const refImplied = refPrices.map(impliedProbFromPrice);
+            refNormalized = normalizeImpliedProbs(refImplied);
+          } else {
+            // No external reference available: be conservative and assume no EV (avoid false positives)
+            refNormalized = winNormalized.slice();
+          }
+
+          // Persist per outcome
+          const labels = ["1", "N", "2"];
+          for (let i = 0; i < 3; i++) {
+            const outcome = labels[i];
+            const price = prices[i];
+            const probability = winNormalized[i];
+            const evPlus = computeEvPlusPercent(winNormalized[i], refNormalized[i]);
+
+            await prisma.odds.upsert({
+              where: { id: `${match.id}-${outcome}` },
+              update: { price, probability, evPlus },
+              create: {
+                id: `${match.id}-${outcome}`,
+                matchId: match.id,
+                provider: "winamax",
+                market: "1N2",
+                outcome,
+                price,
+                probability,
+                evPlus,
+              },
+            });
+          }
         }
       } else {
         // Format structuré
         for (const m of markets) {
+          const marketKey = (m.key ?? m.name ?? "").toString();
           const outcomes = m.outcomes ?? m.legs ?? [];
-          for (const o of outcomes) {
-            const outcomeLabel = o.name ?? o.label ?? "1";
-            const price = Number(o.price ?? o.odds ?? o.decimal) || null;
-            if (!price) continue;
 
-            const impliedProb = 1 / price;
-            const estimatedProb = impliedProb * 1.02;
-            const evPlus = (estimatedProb - impliedProb) * 100;
+          // Detect 1N2 / Match Result markets to compute normalized probabilities
+          if (/1\s?X?N?2|match result|1n2/i.test(marketKey)) {
+            // try to extract three prices in order
+            const extracted: number[] = [];
+            for (const o of outcomes.slice(0, 3)) {
+              const price = Number(o.price ?? o.odds ?? o.decimal ?? o.value ?? o) || 0;
+              extracted.push(price);
+            }
+            if (extracted.length === 3 && extracted.every((p) => p > 0)) {
+              const winImplied = extracted.map(impliedProbFromPrice);
+              const winNormalized = normalizeImpliedProbs(winImplied);
 
-            await prisma.odds.create({
-              data: {
-                matchId: match.id,
-                provider: "winamax",
-                market: m.key ?? m.name ?? "1N2",
-                outcome: outcomeLabel,
-                price,
-                probability: estimatedProb,
-                evPlus,
-              },
-            });
+              const refPrices = await fetchReferenceOdds(home, away, new Date(startAt));
+              let refNormalized: number[] | null = null;
+              if (refPrices) {
+                const refImplied = refPrices.map(impliedProbFromPrice);
+                refNormalized = normalizeImpliedProbs(refImplied);
+              } else {
+                refNormalized = winNormalized.slice();
+              }
+
+              for (let i = 0; i < 3; i++) {
+                const o = outcomes[i];
+                const outcomeLabel = o.name ?? o.label ?? `${i + 1}`;
+                const price = extracted[i];
+                const probability = winNormalized[i];
+                const evPlus = computeEvPlusPercent(winNormalized[i], refNormalized[i]);
+
+                await prisma.odds.create({
+                  data: {
+                    matchId: match.id,
+                    provider: "winamax",
+                    market: m.key ?? m.name ?? "1N2",
+                    outcome: outcomeLabel,
+                    price,
+                    probability,
+                    evPlus,
+                  },
+                });
+              }
+            }
+          } else {
+            // Non 1N2 markets: fall back to per-outcome implied probability, no external reference
+            for (const o of outcomes) {
+              const outcomeLabel = o.name ?? o.label ?? o.key ?? "";
+              const price = Number(o.price ?? o.odds ?? o.decimal) || null;
+              if (!price) continue;
+
+              const impliedProb = impliedProbFromPrice(price);
+              const estimatedProb = impliedProb; // conservative: don't inflate
+              const evPlus = 0; // unknown without reference
+
+              await prisma.odds.create({
+                data: {
+                  matchId: match.id,
+                  provider: "winamax",
+                  market: m.key ?? m.name ?? "other",
+                  outcome: outcomeLabel,
+                  price,
+                  probability: estimatedProb,
+                  evPlus,
+                },
+              });
+            }
           }
         }
       }
