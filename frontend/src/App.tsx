@@ -32,6 +32,12 @@ function formatDate(iso: string) {
   });
 }
 
+function isTodayOrLater(iso: string) {
+  const matchDate = new Date(iso);
+  const now = new Date();
+  return matchDate >= now;
+}
+
 export default function App() {
   const { data, isLoading, isError, error } = useQuery<Match[]>({
     queryKey: ["matches"],
@@ -74,27 +80,29 @@ export default function App() {
               </tr>
             </thead>
             <tbody>
-              {data?.flatMap((match) =>
-                match.odds.map((odd) => {
-                  const highlight = (odd.evPlus ?? 0) >= evPlusThreshold;
-                  return (
-                    <tr
-                      key={odd.id}
-                      style={{
-                        background: highlight ? "#dcfce7" : "transparent",
-                      }}
-                    >
-                      <td style={tdStyle}>{formatDate(match.startAt)}</td>
-                      <td style={tdStyle}>{`${match.homeTeam} vs ${match.awayTeam}`}</td>
-                      <td style={tdStyle}>{odd.market}</td>
-                      <td style={tdStyle}>{odd.outcome}</td>
-                      <td style={tdStyle}>{odd.price.toFixed(2)}</td>
-                      <td style={tdStyle}>{odd.probability ? `${(odd.probability * 100).toFixed(1)} %` : "-"}</td>
-                      <td style={tdStyle}>{odd.evPlus !== null ? `${odd.evPlus.toFixed(1)} %` : "-"}</td>
-                    </tr>
-                  );
-                })
-              )}
+              {data
+                ?.filter((match) => isTodayOrLater(match.startAt))
+                .flatMap((match) =>
+                  match.odds.map((odd) => {
+                    const highlight = (odd.evPlus ?? 0) >= evPlusThreshold;
+                    return (
+                      <tr
+                        key={odd.id}
+                        style={{
+                          background: highlight ? "#dcfce7" : "transparent",
+                        }}
+                      >
+                        <td style={tdStyle}>{formatDate(match.startAt)}</td>
+                        <td style={tdStyle}>{`${match.homeTeam} vs ${match.awayTeam}`}</td>
+                        <td style={tdStyle}>{odd.market}</td>
+                        <td style={tdStyle}>{odd.outcome}</td>
+                        <td style={tdStyle}>{odd.price.toFixed(2)}</td>
+                        <td style={tdStyle}>{odd.probability ? `${(odd.probability * 100).toFixed(1)} %` : "-"}</td>
+                        <td style={tdStyle}>{odd.evPlus !== null ? `${odd.evPlus.toFixed(1)} %` : "-"}</td>
+                      </tr>
+                    );
+                  })
+                )}
             </tbody>
           </table>
         </div>
