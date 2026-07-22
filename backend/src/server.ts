@@ -3,6 +3,7 @@ import cron from "node-cron";
 import { PrismaClient } from "@prisma/client";
 import { fetchWinamaxAndStore } from "./scraper";
 import xgService from "./xgService";
+import importXg from "../scripts/import_xg_from_url";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -78,6 +79,21 @@ async function startServer() {
       res.json(stats);
     } catch (err) {
       console.error("GET /api/xg/stats failed:", err);
+      res.status(500).json({ error: "internal" });
+    }
+  });
+
+  // Admin: import xG stats from a public URL (CSV or JSON). Body: { url }
+  app.post("/api/xg/import", async (req, res) => {
+    try {
+      const { url } = req.body;
+      const src = url || process.env.XG_SOURCE_URL;
+      if (!src) return res.status(400).json({ error: "url is required in body or set XG_SOURCE_URL env" });
+      const ok = await importXg.importFromUrl(src);
+      if (!ok) return res.status(500).json({ error: "import failed" });
+      res.json({ ok: true });
+    } catch (err) {
+      console.error("POST /api/xg/import failed:", err);
       res.status(500).json({ error: "internal" });
     }
   });
