@@ -12,6 +12,59 @@ const WINAMAX_HTML_URL = "https://www.winamax.fr/paris-sportifs/sports/1";
 const REF_ODDS_API_URL = process.env.REF_ODDS_API_URL; // ex: https://api.myoddsprovider.com/getOdds
 const REF_ODDS_API_KEY = process.env.REF_ODDS_API_KEY;
 const REF_ODDS_PROVIDER = process.env.REF_ODDS_PROVIDER || null; // optional provider name for storage
+const MODEL_WEIGHT = Number(process.env.MODEL_WEIGHT ?? 0.6); // weight for model vs market (0..1)
+const XG_API_URL = process.env.XG_API_URL || null; // optional endpoint returning { home_xg, away_xg }
+
+function poisson(k: number, lambda: number) {
+  return Math.exp(-lambda) * Math.pow(lambda, k) / factorial(k);
+}
+
+function factorial(n: number) {
+  if (n <= 1) return 1;
+  let f = 1;
+  for (let i = 2; i <= n; i++) f *= i;
+  return f;
+}
+
+async function fetchModelProbabilities(home: string, away: string, startAt: Date) {
+  // If XG API is configured, try to fetch expected goals for both teams and compute win/draw/away probabilities
+  if (!XG_API_URL) return null;
+  try {
+    const res = await axios.get(XG_API_URL, { params: { home, away, date: startAt.toISOString() }, timeout: 10000 });
+    const d = res.data;
+    const lambdaHome = Number(d.home_xg ?? d.xg_home ?? d.home_expected_goals ?? null);
+    const lambdaAway = Number(d.away_xg ?? d.xg_away ?? d.away_expected_goals ?? null);
+    if (!isFinite(lambdaHome) || !isFinite(lambdaAway)) return null;
+
+    // Compute match outcome probabilities with independent Poisson (simple, common approximation)
+    const maxGoals = 10;
+    const probsHome = new Array(maxGoals + 1).fill(0).map((_, k) => poisson(k, lambdaHome));
+    const probsAway = new Array(maxGoals + 1).fill(0).map((_, k) => poisson(k, lambdaAway));
+
+    let pHome = 0, pDraw = 0, pAway = 0;
+    for (let i = 0; i <= maxGoals; i++) {
+      for (let j = 0; j <= maxGoals; j++) {
+        const p = probsHome[i] * probsAway[j];
+        if (i > j) pHome += p;
+        else if (i === j) pDraw += p;
+        else pAway += p;
+      }
+    }
+
+    const sum = pHome + pDraw + pAway;
+    if (sum <= 0) return null;
+    return [pHome / sum, pDraw / sum, pAway / sum];
+  } catch (err) {
+    console.warn("XG model fetch failed:", err instanceof Error ? err.message : err);
+    return null;
+  }
+}
+
+function computeEvPercent(price: number, trueProb: number) {
+  // Expected value per unit stake = trueProb * price - 1
+  // Return percentage of stake
+  return (trueProb * price - 1) * 100;
+}
 
 function impliedProbFromPrice(price: number) {
   return 1 / price;
@@ -471,9 +524,32 @@ export async function fetchWinamaxAndStore() {
           if (refPrices) {
             const refImplied = refPrices.map(impliedProbFromPrice);
             refNormalized = normalizeImpliedProbs(refImplied);
-          } else {
-            // No external reference available: be conservative and assume no EV (avoid false positives)
-            refNormalized = winNormalized.slice();
+          }
+
+          // Try model-based probabilities (xG) if available
+          const modelProbs = await fetchModelProbabilities(home, away, new Date(startAt));
+
+          // Determine true probability as weighted combo: model (if any) and reference market (if any)
+          const trueProbabilities: number[] = [0, 0, 0];
+          for (let i = 0; i < 3; i++) {
+            const marketProb = winNormalized[i];
+            const refProb = refNormalized ? refNormalized[i] : null;
+            const modelProb = modelProbs ? modelProbs[i] : null;
+
+            let trueP: number;
+            if (modelProb !== null && refProb !== null) {
+              // combine model and market-reference
+              trueP = MODEL_WEIGHT * modelProb + (1 - MODEL_WEIGHT) * refProb;
+            } else if (refProb !== null) {
+              trueP = refProb; // use market reference
+            } else if (modelProb !== null) {
+              trueP = modelProb; // use internal model
+            } else {
+              // conservative fallback: use winamax normalized (no EV)
+              trueP = winNormalized[i];
+            }
+
+            trueProbabilities[i] = trueP;
           }
 
           // Persist per outcome
@@ -481,15 +557,16 @@ export async function fetchWinamaxAndStore() {
           for (let i = 0; i < 3; i++) {
             const outcome = labels[i];
             const price = prices[i];
-            const probability = winNormalized[i];
-            const evPlus = computeEvPlusPercent(winNormalized[i], refNormalized[i]);
+            const winProb = winNormalized[i];
+            const trueProb = trueProbabilities[i];
+            const evPlus = computeEvPercent(price, trueProb);
             const refPrice = refPrices ? refPrices[i] : null;
             const refProb = refNormalized ? refNormalized[i] : null;
             const refProvider = REF_ODDS_PROVIDER || (REF_ODDS_API_URL ? new URL(REF_ODDS_API_URL).host : null);
 
             await prisma.odds.upsert({
               where: { id: `${match.id}-${outcome}` },
-              update: { price, probability, evPlus, refPrice, refProvider, refProb },
+              update: { price, probability: trueProb, evPlus, refPrice, refProvider, refProb },
               create: {
                 id: `${match.id}-${outcome}`,
                 matchId: match.id,
@@ -497,7 +574,7 @@ export async function fetchWinamaxAndStore() {
                 market: "1N2",
                 outcome,
                 price,
-                probability,
+                probability: trueProb,
                 refPrice,
                 refProvider,
                 refProb,
@@ -529,16 +606,28 @@ export async function fetchWinamaxAndStore() {
               if (refPrices) {
                 const refImplied = refPrices.map(impliedProbFromPrice);
                 refNormalized = normalizeImpliedProbs(refImplied);
-              } else {
-                refNormalized = winNormalized.slice();
+              }
+
+              const modelProbs = await fetchModelProbabilities(home, away, new Date(startAt));
+
+              const trueProbabilities: number[] = [0,0,0];
+              for (let i = 0; i < 3; i++) {
+                const refProb = refNormalized ? refNormalized[i] : null;
+                const modelProb = modelProbs ? modelProbs[i] : null;
+                let trueP: number;
+                if (modelProb !== null && refProb !== null) trueP = MODEL_WEIGHT * modelProb + (1 - MODEL_WEIGHT) * refProb;
+                else if (refProb !== null) trueP = refProb;
+                else if (modelProb !== null) trueP = modelProb;
+                else trueP = winNormalized[i];
+                trueProbabilities[i] = trueP;
               }
 
               for (let i = 0; i < 3; i++) {
                 const o = outcomes[i];
                 const outcomeLabel = o.name ?? o.label ?? `${i + 1}`;
                 const price = extracted[i];
-                const probability = winNormalized[i];
-                const evPlus = computeEvPlusPercent(winNormalized[i], refNormalized[i]);
+                const trueProb = trueProbabilities[i];
+                const evPlus = computeEvPercent(price, trueProb);
                 const refPrice = refPrices ? refPrices[i] : null;
                 const refProb = refNormalized ? refNormalized[i] : null;
                 const refProvider = REF_ODDS_PROVIDER || (REF_ODDS_API_URL ? new URL(REF_ODDS_API_URL).host : null);
@@ -550,7 +639,7 @@ export async function fetchWinamaxAndStore() {
                     market: m.key ?? m.name ?? "1N2",
                     outcome: outcomeLabel,
                     price,
-                    probability,
+                    probability: trueProb,
                     refPrice,
                     refProvider,
                     refProb,
