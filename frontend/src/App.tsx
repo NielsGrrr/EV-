@@ -33,12 +33,15 @@ function formatDate(iso: string) {
 }
 
 export default function App() {
-  const { data, isLoading, isError, error } = useQuery<Match[]>(["matches"], async () => {
-    const res = await fetch("/api/matches");
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
+  const { data, isLoading, isError, error } = useQuery<Match[]>({
+    queryKey: ["matches"],
+    queryFn: async () => {
+      const res = await fetch("/api/matches");
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      return res.json();
     }
-    return res.json();
   });
 
   return (
